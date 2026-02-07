@@ -32,7 +32,7 @@ st.title("🔮 Soul Algorithm: Tarot Video Fabricator")
 st.markdown("Generiere TikTok-Ready Videos aus deinen Audio- & Bild-Assets.")
 
 # --- HELPER FUNCTIONS ---
-def create_video(audio_file, illus_file, frame_file, zoom_strength=0.05):
+def create_video(audio_file, illus_file, frame_file, zoom_strength=0.05, use_gpu=False):
     """
     Core Logic: Kombiniert Audio, Illustration und Rahmen zu einem Video.
     """
@@ -110,13 +110,13 @@ def create_video(audio_file, illus_file, frame_file, zoom_strength=0.05):
         art_clip = ImageClip(art_temp_path).with_duration(duration)
         art_clip = art_clip.with_position(("center", "center"))
 
-        # Zoom Effect
-        try:
-             # We use a very slight zoom to avoid huge memory usage during resize
-             # Transforming a smaller image is better
-             art_clip = art_clip.with_effects([Resize(new_size=lambda t: 1 + (zoom_strength * t))])
-        except Exception as e:
-             st.warning(f"Zoom effect disabled: {e}")
+        if zoom_strength > 0.0:
+            try:
+                 # We use a very slight zoom to avoid huge memory usage during resize
+                 # Transforming a smaller image is better
+                 art_clip = art_clip.with_effects([Resize(new_size=lambda t: 1 + (zoom_strength * t))])
+            except Exception as e:
+                 st.warning(f"Zoom effect disabled: {e}")
 
         # 5. Der Rahmen / Overlay 
         # Resize frame exactly to Target Size with PIL
@@ -131,26 +131,89 @@ def create_video(audio_file, illus_file, frame_file, zoom_strength=0.05):
         # 6. Compositing 
         # Standard compositing can still be heavy. 
         # We ensure all clips are strictly typed and sized.
-        final_video = CompositeVideoClip([
-            canvas,
-            bg_clip,      
-            art_clip,     
-            frame_clip    
-        ], size=TIKTOK_SIZE)
+        
+        # FAST MODE OPTIMIZATION
+        # If no zoom is applied, we pre-render the entire frame with Pillow.
+        # This completely bypasses MoviePy's frame-by-frame compositing.
+        if zoom_strength == 0.0:
+             # Load images again with PIL for clean compositing
+             with Image.open(bg_temp_path) as bg_pil, \
+                  Image.open(art_temp_path) as art_pil, \
+                  Image.open(frame_temp_path) as frame_pil:
+                
+                # Create base canvas/artwork layer
+                # Ensure Alpha channels
+                bg_pil = bg_pil.convert("RGBA")
+                art_pil = art_pil.convert("RGBA")
+                frame_pil = frame_pil.convert("RGBA")
+                
+                # Composite Background (already sized)
+                # Apply opacity manually? Pillow puts it on top. 
+                # Better: Blend manually
+                # Create a black canvas
+                canvas_pil = Image.new("RGBA", TIKTOK_SIZE, (10,10,10, 255))
+                
+                # Blend BG with opacity 0.4
+                # To do this in PIL:
+                # 1. Paste BG
+                # 2. Blend with constant alpha using putalpha? 
+                # Easier: enhance brightness? No, opacity.
+                bg_pil.putalpha(int(255 * 0.4)) 
+                
+                # Paste BG on Canvas
+                # Center it? It's already cropped to TIKTOK_SIZE in step 3
+                canvas_pil.alpha_composite(bg_pil, (0,0))
+                
+                # Paste Art (Centered)
+                art_x = (TIKTOK_SIZE[0] - art_pil.width) // 2
+                art_y = (TIKTOK_SIZE[1] - art_pil.height) // 2
+                canvas_pil.alpha_composite(art_pil, (art_x, art_y))
+                
+                # Paste Frame (Centered/Full)
+                canvas_pil.alpha_composite(frame_pil, (0,0))
+                
+                # Save static composite
+                static_composite_path = tempfile.mktemp(suffix=".png")
+                canvas_pil.save(static_composite_path)
+                
+                # Create simple clip
+                final_video = ImageClip(static_composite_path).with_duration(duration)
+                
+        else:
+            # DYNAMIC MODE (Zoom enabled)
+            # Use MoviePy compositing (slower, but dynamic)
+            final_video = CompositeVideoClip([
+                canvas,
+                bg_clip,      
+                art_clip,     
+                frame_clip    
+            ], size=TIKTOK_SIZE)
 
         final_video = final_video.with_audio(audio_clip)
 
         # 7. Export with efficient settings
         output_path = tempfile.mktemp(suffix=".mp4")
         
-        final_video.write_videofile(
-            output_path, 
-            fps=FPS, 
-            codec="libx264", 
-            audio_codec="aac",
-            preset="faster", # faster encoding uses less memory than medium usually
-            threads=2       # Reduce threads to save memory per thread
-        )
+        # GPU / CPU Rendering Logic
+        if use_gpu:
+             final_video.write_videofile(
+                output_path, 
+                fps=FPS, 
+                codec="h264_nvenc", 
+                audio_codec="aac",
+                preset="p2", # Fast preset for NVENC (Speed priority)
+                threads=4,
+                ffmpeg_params=["-rc", "vbr"]
+            )
+        else:
+            final_video.write_videofile(
+                output_path, 
+                fps=FPS, 
+                codec="libx264", 
+                audio_codec="aac",
+                preset="faster", # faster encoding uses less memory than medium usually
+                threads=2       # Reduce threads to save memory per thread
+            )
         
         # Cleanup intermediate optimized files
         try:
@@ -189,7 +252,9 @@ with col1:
     uploaded_frame = st.file_uploader("Rahmen/Overlay (.png Transparent)", type=["png"])
     
     st.write("---")
+    st.info("💡 Tipp: Setze Zoom auf 0.0 für maximale Geschwindigkeit (vermeidet CPU-Resizing pro Frame).")
     zoom_level = st.slider("Zoom-Intensität (Vibe)", 0.0, 0.1, 0.04)
+    use_gpu = st.checkbox("Use GPU Acceleration (Local Only - NVENC)", value=False)
 
 with col2:
     st.header("2. Preview & Output")
@@ -201,7 +266,8 @@ with col2:
                     uploaded_audio, 
                     uploaded_illus, 
                     uploaded_frame,
-                    zoom_strength=zoom_level
+                    zoom_strength=zoom_level,
+                    use_gpu=use_gpu
                 )
                 
                 if video_path:
